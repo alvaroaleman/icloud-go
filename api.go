@@ -6,12 +6,13 @@ import (
 	"fmt"
 	"io/ioutil"
 	"net/http"
-	"net/http/cookiejar"
+	"os"
 	"strings"
+
+	"github.com/alvaroaleman/icloud-go/internal/cookiejar"
 
 	"github.com/gofrs/uuid"
 	"github.com/hashicorp/go-retryablehttp"
-	"golang.org/x/net/publicsuffix"
 	"k8s.io/apimachinery/pkg/util/sets"
 )
 
@@ -65,6 +66,8 @@ func (s *Session) do(ctx context.Context, params requestParameters) error {
 		return fmt.Errorf("failed to construct request: %w", err)
 	}
 	req.Header.Set("Accept", "application/json")
+	req.Header.Set("Origin", "https://www.icloud.com")
+	req.Header.Set("Referer", "https://www.icloud.com/")
 
 	if strings.HasPrefix(params.url, AuthEndpoint) {
 		s.addAuthHeaders(req)
@@ -187,14 +190,28 @@ func (s *Session) authenticateWithToken(ctx context.Context) error {
 			ExtendedLogin:      true,
 			TrustToken:         s.TrustToken,
 		},
-		url: SetupEndpoint + "/accountLogin",
-		other: func(r *retryablehttp.Request) {
-			r.Header.Set("Origin", "https://www.icloud.com")
-			r.Header.Set("Referer", "https://www.icloud.com/")
-
-		},
+		url:                 SetupEndpoint + "/accountLogin",
 		expectedStatusCodes: sets.NewInt(200),
 		into:                &s.Data,
+	})
+}
+
+func (s *Session) validateSession(ctx context.Context, token string) error {
+	return s.do(ctx, requestParameters{
+		method: http.MethodPost,
+		url:    SetupEndpoint + "/validate",
+		other: func(r *retryablehttp.Request) {
+			r.Header.Set("X-Apple-Id-Session-Id", token)
+
+		},
+	})
+}
+
+func (s *Session) validateToken(ctx context.Context) error {
+	return s.do(ctx, requestParameters{
+		method:              http.MethodPost,
+		url:                 SetupEndpoint + "/validate",
+		expectedStatusCodes: sets.NewInt(200),
 	})
 }
 
@@ -207,12 +224,30 @@ type authenticationData struct {
 
 type CredentialFetcher func() (string, error)
 
+func NewFromCookieFile(ctx context.Context, path string) error {
+	jar, err := cookiejar.NewFromPath(path)
+	if err != nil {
+		return fmt.Errorf("failed to create cookie jar: %w", err)
+	}
+	s := Session{
+		// TODO: We don't have the client id anymore - Is that ok?
+		client: retryablehttp.NewClient(),
+	}
+	s.client.HTTPClient.Jar = jar
+
+	if err := s.validateToken(ctx); err != nil {
+		return fmt.Errorf("failed to validate token: %w", err)
+	}
+
+	return nil
+}
+
 func Login(ctx context.Context, user string, password, twoFactorCode CredentialFetcher) error {
 	sessionUUID, err := uuid.DefaultGenerator.NewV1()
 	if err != nil {
 		return fmt.Errorf("failed to generate session UUID: %w", err)
 	}
-	cookieJar, err := cookiejar.New(&cookiejar.Options{PublicSuffixList: publicsuffix.List})
+	cookieJar, err := cookiejar.New()
 	if err != nil {
 		return fmt.Errorf("failed to create cookie jar: %w", err)
 	}
@@ -231,6 +266,19 @@ func Login(ctx context.Context, user string, password, twoFactorCode CredentialF
 			return
 		}
 		println(string(serialized))
+	}()
+	defer func() {
+		tmpFile, err := os.CreateTemp("", "")
+		if err != nil {
+			fmt.Printf("failed to get tempfile: %v\n", err)
+			return
+		}
+		defer tmpFile.Close()
+		if err := cookieJar.Save(tmpFile); err != nil {
+			fmt.Printf("failed to save cookie jar to %s: %v\n", tmpFile.Name(), err)
+			return
+		}
+		fmt.Printf("cookie jar saved to %s\n", tmpFile.Name())
 	}()
 
 	passcode, err := password()
