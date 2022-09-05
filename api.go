@@ -165,6 +165,7 @@ func (s *Session) trustSession(ctx context.Context) error {
 				r.Header.Set("scnt", s.SCNT)
 			}
 		},
+		expectedStatusCodes: sets.NewInt(204),
 	}); err != nil {
 		return fmt.Errorf("failed to trust session: %w", err)
 	}
